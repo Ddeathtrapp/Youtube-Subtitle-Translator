@@ -10,6 +10,7 @@ KEEP_HOURS, SPEED_EVERY, SPEED_BYTES = 48, 600, 2_000_000
 # code, display name, ISO-639-2 tag for the subtitle track. Arabic first = default.
 TARGETS = [("ar", "Arabic", "ara"), ("en", "English", "eng"), ("tr", "Turkish", "tur"), ("es", "Spanish", "spa"),
            ("fr", "French", "fra"), ("de", "German", "deu"), ("ur", "Urdu", "urd"), ("fa", "Persian", "fas")]
+INCLUDE_AUTO = True  # False = manual captions only
 ACTIVE = ("queued", "downloading", "translating", "muxing")
 
 app = FastAPI()
@@ -80,7 +81,7 @@ def run(j):
         upd(j, status="downloading", pct=0, detail="")
         fmt = f"bv*[vcodec^=avc1][height<={J['height']}]+ba[ext=m4a]/b[ext=mp4][height<={J['height']}]"
         cmd = ["yt-dlp", "--no-playlist", "--newline", "--restrict-filenames", "--js-runtimes", "node",
-               "-f", fmt, "--merge-output-format", "mp4", "--write-subs", "--sub-langs", J["src"],
+               "-f", fmt, "--merge-output-format", "mp4", "--write-subs", "--write-auto-subs", "--sub-langs", J["src"],
                "--convert-subs", "srt", "-o", str(d / "%(title).80B.%(ext)s"), "--", J["url"]]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         procs[j] = p
@@ -148,9 +149,14 @@ def fetch(r: Fetch):
     dur = int(info.get("duration") or 0)
     h, m, s = dur // 3600, (dur % 3600) // 60, dur % 60
     dstr = f"{h}:{m:02d}:{s:02d}" if h else (f"{m}:{s:02d}" if dur else "")
-    # manual captions only (auto-generated are intentionally excluded)
     subs = [{"code": c, "name": (v[0].get("name") if v else None) or c}
             for c, v in (info.get("subtitles") or {}).items() if c != "live_chat"]
+    if INCLUDE_AUTO:  # auto-generated tracks go after manual ones, labelled "(auto)"
+        auto = info.get("automatic_captions") or {}
+        auto = {c: v for c, v in auto.items() if c.endswith("-orig")} or auto  # prefer the spoken-language track
+        have = {x["code"] for x in subs}
+        subs += [{"code": c, "name": ((v[0].get("name") if v else None) or c) + " (auto)"}
+                 for c, v in auto.items() if c not in have]
     fm = info.get("formats", [])
     size = lambda f: int(f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 125 * dur)
     aud = max((f for f in fm if f.get("vcodec") == "none" and str(f.get("acodec", "")).startswith("mp4a")),
