@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-requests
-deep-translator
 yt-dlp[default]
+ctranslate2
+transformers
+huggingface_hub
