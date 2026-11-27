@@ -1,6 +1,5 @@
-import os, re, json, time, shutil, threading, queue, subprocess, uuid, urllib.request
+import gc, os, re, json, time, shutil, threading, queue, subprocess, uuid, urllib.request
 from pathlib import Path
-from deep_translator import GoogleTranslator
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
@@ -11,6 +10,27 @@ KEEP_HOURS, SPEED_EVERY, SPEED_BYTES = 48, 600, 2_000_000
 TARGETS = [("ar", "Arabic", "ara"), ("en", "English", "eng"), ("tr", "Turkish", "tur"), ("es", "Spanish", "spa"),
            ("fr", "French", "fra"), ("de", "German", "deu"), ("ur", "Urdu", "urd"), ("fa", "Persian", "fas")]
 INCLUDE_AUTO = True  # False = manual captions only
+# NLLB-200 language codes (YouTube caption code -> NLLB). Captions in other languages are hidden from the list.
+LANG = {"ar": "arb_Arab", "tr": "tur_Latn", "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
+        "ur": "urd_Arab", "fa": "pes_Arab", "ru": "rus_Cyrl", "pt": "por_Latn", "it": "ita_Latn", "nl": "nld_Latn",
+        "pl": "pol_Latn", "uk": "ukr_Cyrl", "ro": "ron_Latn", "el": "ell_Grek", "he": "heb_Hebr", "iw": "heb_Hebr",
+        "hi": "hin_Deva", "bn": "ben_Beng", "id": "ind_Latn", "ms": "zsm_Latn", "vi": "vie_Latn", "th": "tha_Thai",
+        "ko": "kor_Hang", "ja": "jpn_Jpan", "zh": "zho_Hans", "zh-Hans": "zho_Hans", "zh-Hant": "zho_Hant",
+        "sv": "swe_Latn", "da": "dan_Latn", "no": "nob_Latn", "nb": "nob_Latn", "fi": "fin_Latn", "cs": "ces_Latn",
+        "hu": "hun_Latn", "bg": "bul_Cyrl", "sr": "srp_Cyrl", "hr": "hrv_Latn", "sk": "slk_Latn", "sl": "slv_Latn",
+        "lt": "lit_Latn", "lv": "lvs_Latn", "et": "est_Latn", "az": "azj_Latn", "ka": "kat_Geor", "hy": "hye_Armn",
+        "kk": "kaz_Cyrl", "uz": "uzn_Latn", "sw": "swh_Latn", "af": "afr_Latn", "sq": "als_Latn", "bs": "bos_Latn",
+        "mk": "mkd_Cyrl", "ta": "tam_Taml", "te": "tel_Telu", "ml": "mal_Mlym", "mr": "mar_Deva", "gu": "guj_Gujr",
+        "pa": "pan_Guru", "ne": "npi_Deva", "si": "sin_Sinh", "my": "mya_Mymr", "km": "khm_Khmr", "fil": "tgl_Latn",
+        "tl": "tgl_Latn", "is": "isl_Latn", "ga": "gle_Latn", "cy": "cym_Latn", "ca": "cat_Latn", "gl": "glg_Latn",
+        "be": "bel_Cyrl", "mn": "khk_Cyrl", "so": "som_Latn", "am": "amh_Ethi", "ha": "hau_Latn", "yo": "yor_Latn",
+        "zu": "zul_Latn", "sd": "snd_Arab", "ps": "pbt_Arab", "tg": "tgk_Cyrl", "ky": "kir_Cyrl", "lo": "lao_Laoo",
+        "jv": "jav_Latn", "su": "sun_Latn", "mt": "mlt_Latn", "lb": "ltz_Latn", "ceb": "ceb_Latn"}
+NLLB = {"600M": ("JustFrederik/nllb-200-distilled-600M-ct2-int8", "facebook/nllb-200-distilled-600M"),
+        "1.3B": ("JustFrederik/nllb-200-distilled-1.3B-ct2-int8", "facebook/nllb-200-distilled-1.3B")}
+SIZE = os.environ.get("NLLB_MODEL", "600M")                 # "1.3B" = better but ~2x slower, ~2.1 GB RAM
+BEAM = int(os.environ.get("NLLB_BEAM", "4"))                # 2 = faster, slightly less accurate
+THREADS = int(os.environ.get("NLLB_THREADS", os.cpu_count() or 2))
 ACTIVE = ("queued", "downloading", "translating", "muxing")
 
 app = FastAPI()
@@ -49,29 +69,57 @@ def parse_srt(path):
         if new: cues.append((lines[1], " ".join(new)))
     return cues
 
-def gcode(code):
-    base = {"zh-Hans": "zh-CN", "zh-Hant": "zh-TW"}.get(code, code.split("-")[0])
-    return base if base in GoogleTranslator().get_supported_languages(as_dict=True).values() else "auto"
+def nllb_code(c):
+    c = c.replace("_", "-")
+    return LANG.get(c) or LANG.get(c.split("-")[0])
+
+def load_nllb():  # loaded per job and freed afterwards, so the RAM is free while downloading/muxing
+    import ctranslate2, transformers, huggingface_hub
+    repo, tokr = NLLB[SIZE]
+    return (ctranslate2.Translator(huggingface_hub.snapshot_download(repo), device="cpu",
+                                   compute_type="int8", intra_threads=THREADS),
+            transformers.AutoTokenizer.from_pretrained(tokr))
+
+def nllb_run(tr, tok, lines, src, tgt):
+    tok.src_lang = src
+    toks = [tok.convert_ids_to_tokens(tok.encode(t, truncation=True, max_length=200)) for t in lines]
+    res = tr.translate_batch(toks, target_prefix=[[tgt]] * len(toks), beam_size=BEAM,
+                             max_batch_size=16, max_decoding_length=256)
+    return [tok.decode(tok.convert_tokens_to_ids(r.hypotheses[0][1:]), skip_special_tokens=True) for r in res]
+
+def has_text(s): return any(c.isalpha() for c in s)  # skips music notes, sound symbols, blanks
+
+def suspicious(s, o):  # empty, left untranslated, or stuck in a repeat loop
+    w = o.split()
+    return (not o.strip() and bool(s.strip())) or (o.strip() == s.strip() and sum(c.isalpha() for c in s) > 6) or \
+        any(w[i] == w[i + 1] == w[i + 2] == w[i + 3] for i in range(len(w) - 3))
 
 def translate(lines, j, src, tgt):
-    g = GoogleTranslator(source=gcode(src), target=tgt)
-    out, bad, streak, total, t0 = [], 0, 0, len(lines), time.time()
-    for l in lines:
-        chk(j)
-        txt = l.replace("\n", " ").strip()
-        res = None
-        for k in range(4):  # retry with backoff: 1s, 3s, 9s
-            try: res = g.translate(txt[:4900]) if txt else ""; break
-            except Exception: time.sleep(3 ** k)
-        if res is None: bad += 1; streak += 1
-        else: streak = 0
-        if streak >= 8: raise RuntimeError("Google Translate is blocking requests - try again later")
-        out.append(res or txt)
-        done = len(out)
-        eta = int((time.time() - t0) * (total - done) / done)
-        upd(j, pct=min(99, done * 100 // total), detail=f"{done}/{total} lines" + (f" • ~{eta // 60}m left" if eta > 60 else ""))
-        time.sleep(0.15)
-    return out, bad
+    if not lines: raise RuntimeError("Caption file had no text")
+    s, t = nllb_code(src), nllb_code(tgt)
+    tr, tok = load_nllb()
+    try:
+        txt = [l.replace("\n", " ").strip() for l in lines]
+        order = sorted(range(len(txt)), key=lambda i: -len(txt[i]))  # similar lengths batch faster; longest first so the ETA is not too optimistic
+        out, t0 = [""] * len(txt), time.time()
+        for k in range(0, len(order), 32):
+            chk(j)
+            idx = [i for i in order[k:k + 32] if has_text(txt[i])]
+            if idx:
+                for i, o in zip(idx, nllb_run(tr, tok, [txt[i] for i in idx], s, t)): out[i] = o
+            done = min(k + 32, len(order))
+            eta = int((time.time() - t0) * (len(order) - done) / done)
+            upd(j, pct=min(99, done * 100 // len(order)),
+                detail=f"{done}/{len(order)} lines" + (f" \u2022 ~{eta // 60}m left" if eta > 60 else ""))
+        bad = [i for i in range(len(txt)) if has_text(txt[i]) and suspicious(txt[i], out[i])]
+        if bad and "eng_Latn" not in (s, t):  # rescue pass: retry the bad lines through English
+            upd(j, detail=f"retrying {len(bad)} lines via English")
+            en = nllb_run(tr, tok, [txt[i] for i in bad], s, "eng_Latn")
+            for i, o in zip(bad, nllb_run(tr, tok, en, "eng_Latn", t)): out[i] = o
+            bad = [i for i in bad if suspicious(txt[i], out[i])]
+        return [o or x for o, x in zip(out, txt)], len(bad)
+    finally:
+        del tr; gc.collect()
 
 def run(j):
     d = DATA / j; d.mkdir(exist_ok=True)
@@ -110,7 +158,7 @@ def run(j):
                         "-disposition:s:0", "default", "-movflags", "+faststart", str(out)],
                        check=True, capture_output=True)
         v.unlink()
-        upd(j, status="done", pct=100, detail="", file=out.name, note=f"({bad} lines left untranslated)" if bad else "")
+        upd(j, status="done", pct=100, detail="", file=out.name, note=f"({bad} lines may be inaccurate)" if bad else "")
     except Exception as e:
         procs.pop(j, None); shutil.rmtree(d, ignore_errors=True)
         upd(j, status="stopped" if j in cancels else "error", detail="", msg="" if j in cancels else str(e)[:200])
@@ -157,6 +205,7 @@ def fetch(r: Fetch):
         have = {x["code"] for x in subs}
         subs += [{"code": c, "name": ((v[0].get("name") if v else None) or c) + " (auto)"}
                  for c, v in auto.items() if c not in have]
+    subs = [x for x in subs if nllb_code(x["code"])]  # only languages the translation model supports
     fm = info.get("formats", [])
     size = lambda f: int(f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 125 * dur)
     aud = max((f for f in fm if f.get("vcodec") == "none" and str(f.get("acodec", "")).startswith("mp4a")),
@@ -179,7 +228,7 @@ def fetch(r: Fetch):
 def add(r: Start):
     m = meta.get(r.mid)
     if not m: raise HTTPException(400, "Video info expired - press Submit again")
-    if r.src not in m["subs"] or r.height not in m["heights"] or r.tgt not in [t[0] for t in TARGETS]:
+    if r.src not in m["subs"] or r.height not in m["heights"] or r.tgt not in [t[0] for t in TARGETS] or nllb_code(r.src) == nllb_code(r.tgt):
         raise HTTPException(400, "Invalid selection")
     if busy(): raise HTTPException(409, "A job is already running")
     j = uuid.uuid4().hex[:8]
