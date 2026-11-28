@@ -1,4 +1,4 @@
-import gc, os, re, json, glob, time, errno, shutil, platform, zipfile, importlib.metadata, threading, queue, subprocess, uuid, urllib.request
+import gc, os, re, sys, json, glob, time, errno, shutil, platform, zipfile, importlib.metadata, threading, queue, subprocess, uuid, urllib.request
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
@@ -6,6 +6,8 @@ from pydantic import BaseModel
 
 DATA = Path(os.environ.get("DATA_DIR", "data")); DATA.mkdir(exist_ok=True)
 LOG = Path(os.environ.get("LOG_DIR", "logs")); LOG.mkdir(exist_ok=True)  # performance logs, kept outside data/ so cleanups never touch them
+CERT = Path(os.environ.get("CERT_DIR", "certs"))  # local HTTPS certificates, made by install.sh
+HTTPS_PORT = int(os.environ.get("HTTPS_PORT", "8443"))
 KEEP_HOURS, SPEED_EVERY, SPEED_BYTES = 48, 600, 2_000_000
 SAMPLE_EVERY = float(os.environ.get("SAMPLE_EVERY", "5"))  # seconds between performance samples while a job runs
 DISK_MARGIN = 500_000_000  # free space needed on top of 2x the video size (download + merged copy)
@@ -465,7 +467,15 @@ def cleaner():
         sweep()
         time.sleep(3600)
 
-for fn in (worker, cleaner, speed_loop, sampler): threading.Thread(target=fn, daemon=True).start()
+def https_server():  # second listener with TLS: same app, same memory, same single worker (needs certs/ from install.sh)
+    if not (CERT / "server.crt").exists(): return
+    try:
+        import uvicorn
+        uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=HTTPS_PORT, ssl_keyfile=str(CERT / "server.key"),
+                                      ssl_certfile=str(CERT / "server.crt"), log_level="warning")).run()
+    except BaseException as e: print("HTTPS listener stopped:", repr(e), file=sys.stderr)
+
+for fn in (worker, cleaner, speed_loop, sampler, https_server): threading.Thread(target=fn, daemon=True).start()
 
 class Fetch(BaseModel):
     url: str
@@ -571,6 +581,12 @@ def stop(j: str):
 @app.get("/api/jobs")
 def lst(): return sorted(jobs.values(), key=lambda x: -x["t"])
 
+@app.get("/ca.crt")
+def ca():  # install this once on the iPhone so the https address shows as secure (public part only, never the key)
+    f = CERT / "ca.crt"
+    if not f.exists(): raise HTTPException(404, "No certificate yet - run install.sh")
+    return FileResponse(f, filename="yt-ar-local-ca.crt", media_type="application/x-x509-ca-cert")
+
 @app.get("/logs.zip")
 def logs():  # all performance logs in one zip: open on the phone, save to Files, send it over
     z = LOG / "export.zip"
@@ -629,6 +645,7 @@ button{font-weight:600;cursor:pointer}
 </div>
 <div id=l></div>
 <p class=none><a href="/logs.zip">Performance logs (zip)</a></p>
+<p class=none id=https></p>
 <div id=toast></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -728,9 +745,10 @@ async function poll(){
 }
 $("u").addEventListener("keydown",e=>{if(e.key==="Enter")submit()});
 $("sq").addEventListener("keydown",e=>{if(e.key==="Enter"){clearTimeout(st);const q=$("sq").value.trim();if(q.length>=2)search(q)}});
+if(location.protocol==="http:")$("https").innerHTML='<a href="/ca.crt">Install HTTPS certificate</a> (once), then use <b>https://'+esc(location.hostname)+':{{HTTPS_PORT}}</b>';
 setInterval(poll,2000);poll();
 </script>"""
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return PAGE.replace("{{HTTPS_PORT}}", str(HTTPS_PORT))
